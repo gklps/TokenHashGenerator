@@ -2,211 +2,174 @@ package main
 
 import (
 	"bufio"
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 
-	"github.com/ipfs/kubo/client/rpc"
+	_ "github.com/mattn/go-sqlite3" // SQLite driver
 )
 
-const (
-	hashLimit         = 4300000 // Maximum token number for hash calculation
-	concurrency       = 100     // Maximum concurrent hash calculations
-	hashFileName      = "token_hashes.txt"
-	bufferSize        = 1024 * 1024 // 1MB buffer size
-	channelBufferSize = 1000        // Buffer size for the channel
-)
-
-var ipfs *rpc.Client
-
-// Initialize IPFS connection
-func init() {
-	var err error
-	ipfs, err = rpc.NewClientWithOpts(context.Background(), rpc.WithHost("localhost"), rpc.WithPort("5002"))
-	if err != nil {
-		log.Fatalf("Error connecting to IPFS daemon: %v", err)
-	}
-}
-
-// calculateSHA256 calculates SHA256 hash
-func calculateSHA256(input string) string {
-	hasher := sha256.New()
-	hasher.Write([]byte(input))
-	return hex.EncodeToString(hasher.Sum(nil))
-}
-
-// calculateAndStoreHashes calculates and stores hashes concurrently to a file
-func calculateAndStoreHashes(limit int, filename string) error {
-	file, err := os.Create(filename)
-	if err != nil {
-		return fmt.Errorf("error creating file: %v", err)
-	}
-	defer file.Close()
-
-	writer := bufio.NewWriterSize(file, bufferSize)
-	defer writer.Flush()
-
-	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, concurrency)
-	hashChannel := make(chan string, channelBufferSize)
-
-	// Writer goroutine
-	go func() {
-		for hash := range hashChannel {
-			if _, err := writer.WriteString(hash); err != nil {
-				log.Printf("Error writing hash: %v", err)
-			}
-		}
-		writer.Flush()
-	}()
-
-	// Worker goroutines
-	for i := 0; i <= limit; i++ {
-		wg.Add(1)
-		semaphore <- struct{}{}
-
-		go func(tokenNumber int) {
-			defer wg.Done()
-			defer func() { <-semaphore }()
-
-			hash := calculateSHA256(strconv.Itoa(tokenNumber))
-			hashChannel <- fmt.Sprintf("%d:%s\n", tokenNumber, hash)
-		}(i)
-	}
-
-	wg.Wait()
-	close(hashChannel) // Close channel when all goroutines are done
-
-	return nil
-}
-
-// handleGetTokenByHash handles API request for token lookup
-func handleGetTokenByHash(filename string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var hashes []string
-		if err := json.NewDecoder(r.Body).Decode(&hashes); err != nil {
-			hash := strings.TrimPrefix(r.URL.Path, "/token/")
-			if hash != "" {
-				hashes = append(hashes, hash)
-			} else {
-				http.Error(w, "Invalid hash input", http.StatusBadRequest)
-				return
-			}
-		}
-
-		response := make(map[string]interface{}) // Use interface{} for flexibility
-		for _, hash := range hashes {
-			tokenNumber, err := getTokenByHashFromFile(hash, filename)
-			if err != nil {
-				response[hash] = err.Error() // Store error message for the hash
-			} else {
-				response[hash] = tokenNumber // Store token number if found
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response) // Encode the entire map
-	}
-}
-
-// handleGetLevelTokenByHash handles API request for level and token lookup by hash
-func handleGetLevelTokenByHash(filename string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		input := strings.TrimPrefix(r.URL.Path, "/leveltoken/")
-		if input == "" {
-			http.Error(w, "Missing level and hash value", http.StatusBadRequest)
-			return
-		}
-		parts := strings.Split(input, "-")
-		if len(parts) != 2 {
-			http.Error(w, "Invalid input format (expected: level-hash)", http.StatusBadRequest)
-			return
-		}
-		level, hash := parts[0], parts[1]
-		if _, err := strconv.Atoi(level); err != nil {
-			http.Error(w, "Invalid level format", http.StatusBadRequest)
-			return
-		}
-
-		tokenNumber, err := getTokenByHashFromFile(hash, filename)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
-			return
-		}
-
-		result := fmt.Sprintf("%s%d", level, tokenNumber)
-		cid, err := addStringToIPFS(result)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Error adding to IPFS: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		response := map[string]string{"Result": result, "CID": cid}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	}
-}
-
-// getTokenByHashFromFile retrieves token number from a hash file
-func getTokenByHashFromFile(hash, filename string) (int, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return 0, fmt.Errorf("error opening file: %v", err)
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.Split(line, ":")
-		if len(parts) == 2 && parts[1] == hash {
-			tokenNumber, err := strconv.Atoi(parts[0])
-			if err != nil {
-				return 0, fmt.Errorf("invalid token number in file: %v", err)
-			}
-			return tokenNumber, nil
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return 0, fmt.Errorf("error scanning file: %v", err)
-	}
-	return 0, fmt.Errorf("hash not found")
-}
-
-// addStringToIPFS adds a string to IPFS and returns the CID
-func addStringToIPFS(data string) (string, error) {
-	// Add the data to IPFS using the new client
-	result, err := ipfs.Add(context.Background(), strings.NewReader(data))
-	if err != nil {
-		return "", err
-	}
-	return result.Cid.String(), nil
+// TokenMap is your provided mapping of levels to maximum token values.
+var TokenMap = map[int]int{
+	0:  0,
+	1:  5000000,
+	2:  2425000,
+	3:  2303750,
+	4:  2188563,
+	5:  2079134,
+	6:  1975178,
+	7:  1876419,
+	8:  1782598,
+	9:  1693468,
+	10: 1608795,
+	11: 1528355,
+	12: 1451937,
+	13: 1379340,
+	14: 1310373,
+	15: 1244855,
+	16: 1182612,
+	17: 1123481,
+	18: 1067307,
+	19: 1013942,
+	20: 963245,
+	21: 915082,
+	22: 869328,
+	23: 825862,
+	24: 784569,
+	25: 745340,
+	26: 708073,
+	27: 672670,
+	28: 639036,
+	29: 607084,
+	30: 576730,
+	31: 547894,
+	32: 520499,
+	33: 494474,
+	34: 469750,
+	35: 446263,
+	36: 423950,
+	37: 402752,
+	38: 382615,
+	39: 363484,
+	40: 345310,
+	41: 328044,
+	42: 311642,
+	43: 296060,
+	44: 281257,
+	45: 267194,
+	46: 253834,
+	47: 241143,
+	48: 229085,
+	49: 217631,
+	50: 206750,
+	51: 196412,
+	52: 186592,
+	53: 177262,
+	54: 168399,
+	55: 159979,
+	56: 151980,
+	57: 144381,
+	58: 137162,
+	59: 130304,
+	60: 117273,
+	61: 105546,
+	62: 94992,
+	63: 85492,
+	64: 76943,
+	65: 69249,
+	66: 62324,
+	67: 56092,
+	68: 50482,
+	69: 45434,
+	70: 40891,
+	71: 36802,
+	72: 33121,
+	73: 29809,
+	74: 26828,
+	75: 24146,
+	76: 21731,
+	77: 19558,
+	78: 17602,
 }
 
 func main() {
-	// Calculate and store hashes (optional, run this manually once)
-	if err := calculateAndStoreHashes(hashLimit, hashFileName); err != nil {
-		log.Fatalf("Error calculating and storing hashes: %v", err)
+	// Open database connection
+	db, err := sql.Open("sqlite3", "./token_data.db")
+	if err != nil {
+		fmt.Printf("Error opening database: %v\n", err)
+		return
+	}
+	defer db.Close()
+	// HTTP handler for the verification endpoint
+	http.HandleFunc("/verify", verifyTokensHandler)
+
+	// Start the server
+	fmt.Println("Server listening on port 8080")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		fmt.Printf("Server error: %v\n", err)
+	}
+}
+
+func verifyTokensHandler(w http.ResponseWriter, r *http.Request) {
+	var input []string
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	// API handlers
-	http.HandleFunc("/token/", handleGetTokenByHash(hashFileName))
-	http.HandleFunc("/leveltoken/", handleGetLevelTokenByHash(hashFileName))
-
-	// Start server
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	// Open the token hash file only once
+	file, err := os.Open("token_hashes.txt")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error opening file: %v", err), http.StatusInternalServerError)
+		return
 	}
-	log.Printf("Server listening on port :%s", port)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), nil))
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+
+	results := make(map[string]bool, len(input))
+	for _, tokenHash := range input {
+
+		//tokenHash = strings.TrimPrefix(tokenHash, "00")
+
+		levelStr := strings.TrimLeft(tokenHash[:3], "0") // Trim leading zeros
+		level, _ := strconv.Atoi(levelStr)               // Convert to integer
+		hash := tokenHash[3:]
+		fmt.Printf("Verifying token: %s (level %d)\n", hash, level) // Logging the token and level
+
+		// Efficiently search for the hash in the file
+		found := false
+		for scanner.Scan() {
+			line := scanner.Text()
+			parts := strings.Split(line, ":")
+			if len(parts) == 2 && parts[1] == tokenHash[3:] {
+				fmt.Println("Hash found in file:", line) // Logging the matching line from the file
+				tokenNumber, _ := strconv.Atoi(parts[0])
+				fmt.Printf("Token number: %d, Max value for level %d: %d\n", tokenNumber, level, TokenMap[level])
+				maxTokenValue := TokenMap[level]
+				results[tokenHash] = 0 < tokenNumber && tokenNumber <= maxTokenValue
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			fmt.Printf("Hash not found in file: %s\n", tokenHash[3:]) // Logging when the hash is not found
+			results[tokenHash] = false
+		}
+
+		// Reset the scanner to the beginning of the file for the next token
+		_, err = file.Seek(0, 0) // 0 means start of the file and 0 is the reference point
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error resetting file pointer: %v", err), http.StatusInternalServerError)
+			return
+		}
+		scanner = bufio.NewScanner(file)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
 }
