@@ -1,17 +1,21 @@
 package main
 
 import (
-	"bufio"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	_ "github.com/mattn/go-sqlite3" // SQLite driver
 )
+
+// TokenVerificationResponse represents the structure of the JSON response.
+type TokenVerificationResponse struct {
+	Results map[string]bool `json:"results"`
+}
 
 // TokenMap is your provided mapping of levels to maximum token values.
 var TokenMap = map[int]int{
@@ -96,80 +100,100 @@ var TokenMap = map[int]int{
 	78: 17602,
 }
 
+var db *sql.DB
+var mutex sync.Mutex
+
 func main() {
-	// Open database connection
-	db, err := sql.Open("sqlite3", "./token_data.db")
+	// Open database connection (once)
+	var err error
+	db, err = sql.Open("sqlite3", "./token_data.db")
 	if err != nil {
 		fmt.Printf("Error opening database: %v\n", err)
 		return
 	}
 	defer db.Close()
-	// HTTP handler for the verification endpoint
+
+	// Prepare the database statements (once)
+	prepareStatements(db) // Function to prepare statements (see below)
+
+	// HTTP handler
 	http.HandleFunc("/verify", verifyTokensHandler)
 
-	// Start the server
+	// Start server
 	fmt.Println("Server listening on port 8080")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		fmt.Printf("Server error: %v\n", err)
 	}
 }
 
+// Prepared statements (for better performance)
+var stmtVerifyToken *sql.Stmt
+
+func prepareStatements(db *sql.DB) {
+	var err error
+	stmtVerifyToken, err = db.Prepare("SELECT token_value FROM tokens WHERE token_hash = ?")
+	if err != nil {
+		fmt.Printf("Error preparing statement: %v\n", err)
+		return // Or handle the error more gracefully
+	}
+}
+
 func verifyTokensHandler(w http.ResponseWriter, r *http.Request) {
-	var input []string
+	var input struct {
+		Tokens []string `json:"tokens"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Open the token hash file only once
-	file, err := os.Open("token_hashes.txt")
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Error opening file: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
+	results := make(map[string]bool, len(input.Tokens))
+	// Use WaitGroup for concurrent processing
+	var wg sync.WaitGroup
+	wg.Add(len(input.Tokens)) // Set the number of goroutines to wait for
+	for _, tokenHash := range input.Tokens {
+		go func(tokenHash string) {
+			defer wg.Done() // Signal when the goroutine is done
 
-	results := make(map[string]bool, len(input))
-	for _, tokenHash := range input {
+			levelStr := strings.TrimLeft(tokenHash[:3], "0")
+			level, _ := strconv.Atoi(levelStr)
 
-		//tokenHash = strings.TrimPrefix(tokenHash, "00")
-
-		levelStr := strings.TrimLeft(tokenHash[:3], "0") // Trim leading zeros
-		level, _ := strconv.Atoi(levelStr)               // Convert to integer
-		hash := tokenHash[3:]
-		fmt.Printf("Verifying token: %s (level %d)\n", hash, level) // Logging the token and level
-
-		// Efficiently search for the hash in the file
-		found := false
-		for scanner.Scan() {
-			line := scanner.Text()
-			parts := strings.Split(line, ":")
-			if len(parts) == 2 && parts[1] == tokenHash[3:] {
-				fmt.Println("Hash found in file:", line) // Logging the matching line from the file
-				tokenNumber, _ := strconv.Atoi(parts[0])
-				fmt.Printf("Token number: %d, Max value for level %d: %d\n", tokenNumber, level, TokenMap[level])
-				maxTokenValue := TokenMap[level]
-				results[tokenHash] = 0 < tokenNumber && tokenNumber <= maxTokenValue
-				found = true
-				break
+			hash := tokenHash[3:]
+			fmt.Printf("Verifying token: %s (level %d)\n", hash, level)
+			// Length check:
+			if len(tokenHash) != 67 {
+				fmt.Printf("Invalid token length: %s\n", tokenHash)
+				results[tokenHash] = false
+				return // Skip further processing if the length is invalid
 			}
-		}
 
-		if !found {
-			fmt.Printf("Hash not found in file: %s\n", tokenHash[3:]) // Logging when the hash is not found
-			results[tokenHash] = false
-		}
-
-		// Reset the scanner to the beginning of the file for the next token
-		_, err = file.Seek(0, 0) // 0 means start of the file and 0 is the reference point
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Error resetting file pointer: %v", err), http.StatusInternalServerError)
-			return
-		}
-		scanner = bufio.NewScanner(file)
+			// Lock the mutex to ensure safe concurrent access to the database
+			mutex.Lock()
+			var tokenNumberFromFile int
+			err := stmtVerifyToken.QueryRow(hash).Scan(&tokenNumberFromFile) // Use the prepared statement
+			if err != nil {
+				if err == sql.ErrNoRows {
+					fmt.Printf("Hash not found in database: %s\n", hash)
+				} else {
+					// Log or handle the database error
+					fmt.Printf("Database error: %v\n", err)
+				}
+				results[tokenHash] = false
+			} else {
+				fmt.Printf("Token number: %d (from database), Max value for level %d: %d\n", tokenNumberFromFile, level, TokenMap[level])
+				results[tokenHash] = 0 < tokenNumberFromFile && tokenNumberFromFile <= TokenMap[level]
+			}
+			// Unlock the mutex
+			mutex.Unlock()
+		}(tokenHash) // Passing the tokenHash argument to the goroutine
 	}
+
+	// Wait for all goroutines to finish
+	wg.Wait()
+
+	// Create a TokenVerificationResponse struct and populate it with the results.
+	response := TokenVerificationResponse{Results: results}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(results)
+	json.NewEncoder(w).Encode(response) // Encode the map
 }
